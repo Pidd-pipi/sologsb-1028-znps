@@ -61,8 +61,26 @@ export interface ValidationIssue {
   field: 'properties' | 'examples' | 'keyboard' | 'screenReader';
 }
 
-export interface DiffRow {
-  field: string;
-  before: string;
-  after: string;
+export type RestorableField =
+  | 'name'
+  | 'category'
+  | 'status'
+  | 'purpose'
+  | 'usage'
+  | 'states'
+  | 'keyboardBehavior'
+  | 'screenReader'
+  | 'disabledScenarios'
+  | 'interactionSignature';
+
+export interface RestoreSelection {
+  fields: RestorableField[];
+  propertyIds: string[];
+  exampleIds: string[];
+}
+
+export interface RestoreFailure {
+  exampleId: string;
+  exampleTitle: string;
+  missing: Array<{ id: string; name: string }>;
 }

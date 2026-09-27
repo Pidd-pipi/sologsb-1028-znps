@@ -1,11 +1,22 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import type {
+  ComponentSnapshot,
+  ComponentSpec,
+  RestorableField,
+  RestoreFailure,
+  RestoreSelection,
+  ValidationIssue,
+  WorkspaceState
+} from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 const signature = (component: ComponentSpec) => `${component.properties.map((item) => `${item.name}:${item.required}`).join('|')}::${component.interactionSignature}`;
+const writeRestorableField = <K extends RestorableField>(target: ComponentSpec, field: K, value: ComponentSpec[K]) => {
+  target[field] = value;
+};
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
@@ -174,6 +185,58 @@ export class SpecStore extends EventTarget {
       target.revision = nextRevision;
       target.updatedAt = new Date().toISOString();
     });
+  }
+
+  /**
+   * 把快照中被勾选的字段、属性和示例恢复到当前稿。
+   * 若某个被勾选示例引用的属性在当前稿不存在、也未被一并勾选，则不应用任何修改，
+   * 返回缺失明细；成功时返回 null。快照本身只读，恢复会生成新的修订版本，
+   * 且整个操作进入撤销栈，撤销后回到应用前的状态。
+   */
+  restoreFromSnapshot(revision: number, selection: RestoreSelection): RestoreFailure[] | null {
+    const selected = this.selected;
+    if (!selected) return null;
+    const snapshot = selected.snapshots.find((item) => item.revision === revision);
+    if (!snapshot) return null;
+    const source = snapshot.component;
+
+    const chosenProperties = source.properties.filter((item) => selection.propertyIds.includes(item.id));
+    const chosenExamples = source.examples.filter((item) => selection.exampleIds.includes(item.id));
+
+    const availablePropertyIds = new Set(selected.properties.map((item) => item.id));
+    chosenProperties.forEach((item) => availablePropertyIds.add(item.id));
+    const failures: RestoreFailure[] = [];
+    for (const example of chosenExamples) {
+      const missing = example.propertyIds
+        .filter((id) => !availablePropertyIds.has(id))
+        .map((id) => ({ id, name: source.properties.find((item) => item.id === id)?.name ?? id }));
+      if (missing.length) failures.push({ exampleId: example.id, exampleTitle: example.title, missing });
+    }
+    if (failures.length) return failures;
+
+    this.commit('从快照恢复所选内容', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      if (!target) return;
+      const nextRevision = target.revision + 1;
+      for (const field of selection.fields) {
+        writeRestorableField(target, field, clone(source[field]));
+      }
+      for (const property of chosenProperties) {
+        const restored = clone(property);
+        const index = target.properties.findIndex((item) => item.id === restored.id);
+        if (index >= 0) target.properties[index] = restored;
+        else target.properties.push(restored);
+      }
+      for (const example of chosenExamples) {
+        const restored = { ...clone(example), stale: false, staleReason: '', createdFromRevision: nextRevision };
+        const index = target.examples.findIndex((item) => item.id === restored.id);
+        if (index >= 0) target.examples[index] = restored;
+        else target.examples.push(restored);
+      }
+      target.revision = nextRevision;
+      target.updatedAt = new Date().toISOString();
+    });
+    return null;
   }
 
   migrateExamples() {

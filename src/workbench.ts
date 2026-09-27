@@ -1,8 +1,19 @@
 import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
-import { diffAgainstSnapshot } from './diff';
+import { diffSnapshotEntries, type ExampleDiffEntry, type FieldDiffEntry, type PropertyDiffEntry } from './diff';
 import { SpecStore } from './store';
-import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import type {
+  ComponentExample,
+  ComponentSnapshot,
+  ComponentSpec,
+  PreviewDensity,
+  PreviewTheme,
+  PropertySpec,
+  RestoreFailure,
+  RestoreSelection,
+  RestorableField,
+  ValidationIssue
+} from './types';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
 
@@ -13,7 +24,10 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    checked: { state: true },
+    restoreErrors: { state: true },
+    compareRevision: { state: true }
   };
 
   private store = new SpecStore();
@@ -23,6 +37,10 @@ export class SpecA11yWorkbench extends LitElement {
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
   private showValidation = true;
+  private checked: Set<string> = new Set();
+  private restoreErrors: RestoreFailure[] = [];
+  private compareRevision?: number;
+  private lastDiffKey = '';
   private toastTimer?: number;
 
   static styles = css`
@@ -110,6 +128,14 @@ export class SpecA11yWorkbench extends LitElement {
     .diff { display: grid; gap: 7px; margin-top: 9px; }
     .diff-row { border: 1px solid var(--spectrum-gray-300); border-radius: 8px; padding: 9px; font-size: 11px; }
     .diff-row b { display: block; margin-bottom: 4px; text-transform: capitalize; }
+    .restore-heading { margin: 16px 0 4px; font-size: 13px; }
+    .restore-hint { color: var(--spectrum-gray-700); font-size: 12px; }
+    .restore-row { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+    .restore-row input[type='checkbox'] { margin-top: 3px; flex: none; }
+    .restore-row > span { flex: 1; min-width: 0; }
+    .restore-row .pill { margin-left: 6px; }
+    .restore-row .pill.review { background: var(--spectrum-orange-300); }
+    .restore-missing { display: block; margin-top: 4px; color: var(--spectrum-red-800, #b3271e); }
     .before { color: var(--spectrum-red-800); white-space: pre-wrap; }
     .after { color: var(--spectrum-green-900); white-space: pre-wrap; }
     pre { white-space: pre-wrap; word-break: break-word; background: #202020; color: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 12px; }
@@ -383,22 +409,147 @@ export class SpecA11yWorkbench extends LitElement {
   }
 
   private renderHistory(component: ComponentSpec): TemplateResult {
-    const snapshot = component.snapshots[0];
-    const rows = diffAgainstSnapshot(component, snapshot);
+    const snapshots = component.snapshots;
+    const snapshot = snapshots.find((item) => item.revision === this.compareRevision) ?? snapshots[0];
+    const diffKey = `${component.id}:${snapshot?.revision ?? 'none'}`;
+    if (diffKey !== this.lastDiffKey) {
+      this.lastDiffKey = diffKey;
+      this.checked = new Set();
+      this.restoreErrors = [];
+    }
+    const diff = diffSnapshotEntries(component, snapshot);
     return html`
       <section class="panel">
         <div class="property-head">
           <h2>版本与迁移</h2>
           <sp-button size="s" variant="secondary" @click=${() => this.store.createSnapshot('历史面板保存')}>保存当前版本</sp-button>
         </div>
-        <p>当前为 r${component.revision}。最近快照：${snapshot ? `r${snapshot.revision} · ${new Date(snapshot.savedAt).toLocaleString('zh-CN')}` : '暂无'}。</p>
-        ${snapshot ? html`
-          <h3>与最近快照的差异</h3>
-          ${rows.length ? html`<div class="diff">${rows.map((row) => html`<div class="diff-row"><b>${row.field}</b><span class="before">- ${row.before || '（空）'}</span><br /><span class="after">+ ${row.after || '（空）'}</span></div>`)}</div>` : html`<div class="issue info">当前内容与最近快照一致。</div>`}
-        ` : html`<div class="empty">保存一次版本后即可比较字段、属性和示例变化。</div>`}
+        <p>当前为 r${component.revision}。${snapshot ? `对比快照：r${snapshot.revision} · ${new Date(snapshot.savedAt).toLocaleString('zh-CN')} · ${snapshot.reason}` : '暂无快照。'}</p>
+        ${snapshots.length ? html`
+          <label class="field" style="max-width: 460px">
+            <span>选择要对比与恢复的旧版本</span>
+            <select aria-label="选择旧版本" .value=${String(snapshot.revision)} @change=${(event: Event) => { this.compareRevision = Number((event.currentTarget as HTMLSelectElement).value); }}>
+              ${snapshots.map((item) => html`<option value=${item.revision}>r${item.revision} · ${new Date(item.savedAt).toLocaleString('zh-CN')} · ${item.reason}</option>`)}
+            </select>
+          </label>
+          ${diff.empty ? html`
+            <div class="issue info">当前内容与所选快照一致，没有可恢复的条目。</div>
+          ` : html`
+            <p class="restore-hint">勾选需要沿用到当前稿的字段、属性或示例；未勾选的当前内容保持原样。应用后生成新的修订版本，旧快照不会被修改，可随时撤销。</p>
+            ${this.renderRestoreFields(diff.fields)}
+            ${this.renderRestoreProperties(diff.properties)}
+            ${this.renderRestoreExamples(diff.examples)}
+            ${this.restoreErrors.length ? html`
+              <div class="issue error">
+                <strong>已停止，未应用任何恢复</strong>
+                ${this.restoreErrors.map((failure) => html`
+                  <div>示例「${failure.exampleTitle}」引用的属性当前稿不存在且未勾选：${failure.missing.map((item) => item.name).join('、')}。请勾选对应属性，或取消该示例。</div>
+                `)}
+              </div>
+            ` : nothing}
+            <div class="actions" style="justify-content: flex-start; margin-top: 12px">
+              <sp-button variant="accent" ?disabled=${!this.checked.size} @click=${() => this.applyRestore(snapshot)}>恢复所选到当前稿（${this.checked.size}）</sp-button>
+            </div>
+          `}
+        ` : html`<div class="empty">保存一次版本后即可比较字段、属性和示例变化，并按需恢复。</div>`}
         ${this.hasStaleExamples(component) ? html`<div class="issue warning" style="margin-top: 14px"><strong>检测到待迁移示例</strong>迁移会保留代码内容，清理已删除属性引用并更新契约版本。<br /><button @click=${() => this.store.migrateExamples()}>立即迁移</button></div>` : nothing}
       </section>
     `;
+  }
+
+  private renderRestoreFields(entries: FieldDiffEntry[]): TemplateResult | typeof nothing {
+    if (!entries.length) return nothing;
+    return html`
+      <h3 class="restore-heading">字段</h3>
+      <div class="diff">
+        ${entries.map((entry) => html`
+          <label class="diff-row restore-row">
+            <input type="checkbox" .checked=${this.checked.has(`field:${entry.key}`)} @change=${(event: Event) => this.toggleRestoreItem(`field:${entry.key}`, (event.currentTarget as HTMLInputElement).checked)} />
+            <span>
+              <b>${entry.label}</b>
+              <span class="before">旧版：${entry.before || '（空）'}</span><br />
+              <span class="after">当前：${entry.after || '（空）'}</span>
+            </span>
+          </label>
+        `)}
+      </div>
+    `;
+  }
+
+  private renderRestoreProperties(entries: PropertyDiffEntry[]): TemplateResult | typeof nothing {
+    if (!entries.length) return nothing;
+    return html`
+      <h3 class="restore-heading">属性</h3>
+      <div class="diff">
+        ${entries.map((entry) => html`
+          <label class="diff-row restore-row">
+            <input type="checkbox" .checked=${this.checked.has(`prop:${entry.id}`)} @change=${(event: Event) => this.toggleRestoreItem(`prop:${entry.id}`, (event.currentTarget as HTMLInputElement).checked)} />
+            <span>
+              <b>${entry.name || '未命名属性'}</b>
+              <span class="pill ${entry.change === 'missing' ? 'review' : ''}">${entry.change === 'missing' ? '当前稿已删除' : '与当前稿不同'}</span>
+              <span class="before">旧版：${this.summarizeProperty(entry.before)}</span><br />
+              ${entry.after ? html`<span class="after">当前：${this.summarizeProperty(entry.after)}</span>` : nothing}
+            </span>
+          </label>
+        `)}
+      </div>
+    `;
+  }
+
+  private renderRestoreExamples(entries: ExampleDiffEntry[]): TemplateResult | typeof nothing {
+    if (!entries.length) return nothing;
+    return html`
+      <h3 class="restore-heading">示例</h3>
+      <div class="diff">
+        ${entries.map((entry) => html`
+          <label class="diff-row restore-row">
+            <input type="checkbox" .checked=${this.checked.has(`ex:${entry.id}`)} @change=${(event: Event) => this.toggleRestoreItem(`ex:${entry.id}`, (event.currentTarget as HTMLInputElement).checked)} />
+            <span>
+              <b>${entry.title}</b>
+              <span class="pill ${entry.change === 'missing' ? 'review' : ''}">${entry.change === 'missing' ? '当前稿已删除' : '与当前稿不同'}</span>
+              ${entry.missingDependencies.length ? html`
+                <span class="restore-missing">依赖属性在当前稿不存在：${entry.missingDependencies.map((item) => item.name).join('、')}。应用时需一并在上方勾选这些属性，否则恢复会被阻止。</span>
+              ` : nothing}
+              <pre>${entry.before.code}</pre>
+            </span>
+          </label>
+        `)}
+      </div>
+    `;
+  }
+
+  private summarizeProperty(property: PropertySpec): string {
+    const parts = [property.type || '未知类型'];
+    if (property.required) parts.push('必填');
+    if (property.defaultValue) parts.push(`默认 ${property.defaultValue}`);
+    return `${parts.join(' · ')} — ${property.description || '无说明'}`;
+  }
+
+  private toggleRestoreItem(key: string, on: boolean) {
+    const next = new Set(this.checked);
+    if (on) next.add(key);
+    else next.delete(key);
+    this.checked = next;
+    this.restoreErrors = [];
+  }
+
+  private applyRestore(snapshot: ComponentSnapshot) {
+    const selection: RestoreSelection = { fields: [], propertyIds: [], exampleIds: [] };
+    for (const key of this.checked) {
+      const [kind, ...rest] = key.split(':');
+      const id = rest.join(':');
+      if (kind === 'field') selection.fields.push(id as RestorableField);
+      else if (kind === 'prop') selection.propertyIds.push(id);
+      else if (kind === 'ex') selection.exampleIds.push(id);
+    }
+    const failures = this.store.restoreFromSnapshot(snapshot.revision, selection);
+    if (failures) {
+      this.restoreErrors = failures;
+      return;
+    }
+    this.checked = new Set();
+    this.restoreErrors = [];
+    this.flash(`已恢复所选内容，生成新版本 r${this.store.selected?.revision ?? ''}`);
   }
 
   private renderPreview(component?: ComponentSpec): TemplateResult {
