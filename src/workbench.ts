@@ -1,8 +1,8 @@
 import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
-import { diffAgainstSnapshot } from './diff';
+import { buildRestoreItems } from './diff';
 import { SpecStore } from './store';
-import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import type { ComponentExample, ComponentSnapshot, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
 
@@ -24,6 +24,9 @@ export class SpecA11yWorkbench extends LitElement {
   private toast = '';
   private showValidation = true;
   private toastTimer?: number;
+  private restoreChecked = new Set<string>();
+  private restoreKey = '';
+  private restoreMissing: Array<{ example: string; property: string }> = [];
 
   static styles = css`
     :host {
@@ -110,6 +113,12 @@ export class SpecA11yWorkbench extends LitElement {
     .diff { display: grid; gap: 7px; margin-top: 9px; }
     .diff-row { border: 1px solid var(--spectrum-gray-300); border-radius: 8px; padding: 9px; font-size: 11px; }
     .diff-row b { display: block; margin-bottom: 4px; text-transform: capitalize; }
+    .restore-row { display: flex; gap: 9px; align-items: flex-start; cursor: pointer; }
+    .restore-row input[type='checkbox'] { margin-top: 3px; width: auto; accent-color: var(--spectrum-blue-700); }
+    .restore-row > span { flex: 1; min-width: 0; }
+    .restore-row.picked { border-color: var(--spectrum-blue-600); background: var(--spectrum-blue-100); }
+    .restore-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .restore-hint { color: var(--spectrum-gray-700); font-size: 11px; }
     .before { color: var(--spectrum-red-800); white-space: pre-wrap; }
     .after { color: var(--spectrum-green-900); white-space: pre-wrap; }
     pre { white-space: pre-wrap; word-break: break-word; background: #202020; color: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 12px; }
@@ -384,7 +393,13 @@ export class SpecA11yWorkbench extends LitElement {
 
   private renderHistory(component: ComponentSpec): TemplateResult {
     const snapshot = component.snapshots[0];
-    const rows = diffAgainstSnapshot(component, snapshot);
+    const items = buildRestoreItems(component, snapshot);
+    const restoreKey = `${component.id}:${snapshot?.revision ?? 'none'}:${snapshot?.savedAt ?? ''}`;
+    if (restoreKey !== this.restoreKey) {
+      this.restoreKey = restoreKey;
+      this.restoreChecked.clear();
+      this.restoreMissing = [];
+    }
     return html`
       <section class="panel">
         <div class="property-head">
@@ -393,12 +408,66 @@ export class SpecA11yWorkbench extends LitElement {
         </div>
         <p>当前为 r${component.revision}。最近快照：${snapshot ? `r${snapshot.revision} · ${new Date(snapshot.savedAt).toLocaleString('zh-CN')}` : '暂无'}。</p>
         ${snapshot ? html`
-          <h3>与最近快照的差异</h3>
-          ${rows.length ? html`<div class="diff">${rows.map((row) => html`<div class="diff-row"><b>${row.field}</b><span class="before">- ${row.before || '（空）'}</span><br /><span class="after">+ ${row.after || '（空）'}</span></div>`)}</div>` : html`<div class="issue info">当前内容与最近快照一致。</div>`}
+          <h3>与最近快照的差异（可勾选单独恢复）</h3>
+          ${items.length ? html`
+            <div class="diff">
+              ${items.map((item) => html`
+                <label class="diff-row restore-row ${this.restoreChecked.has(item.id) ? 'picked' : ''}">
+                  <input type="checkbox" .checked=${this.restoreChecked.has(item.id)} @change=${() => this.toggleRestoreItem(item.id)} />
+                  <span>
+                    <b>${item.label}</b>
+                    <span class="before">- ${item.before || '（空）'}</span><br />
+                    <span class="after">+ ${item.after || '（空）'}</span>
+                  </span>
+                </label>
+              `)}
+            </div>
+            <div class="restore-actions">
+              <sp-button size="s" variant="accent" ?disabled=${!this.restoreChecked.size} @click=${() => this.applyRestore(snapshot)}>恢复所选（${this.restoreChecked.size} 项）</sp-button>
+              <span class="restore-hint">仅勾选项从 r${snapshot.revision} 恢复；未勾选的当前内容保持原样，恢复后生成新版本，旧快照不会被改写。</span>
+            </div>
+            ${this.restoreMissing.length ? html`
+              <div class="issue error" style="margin-top: 12px">
+                <strong>恢复已停止：缺少依赖属性</strong>
+                以下示例引用的属性在当前草稿中不存在，也没有被勾选恢复。请勾选对应属性，或取消勾选相关示例：
+                <ul style="margin: 6px 0 0; padding-left: 18px">
+                  ${this.restoreMissing.map((item) => html`<li>示例「${item.example}」缺少属性 ${item.property}</li>`)}
+                </ul>
+              </div>
+            ` : nothing}
+          ` : html`<div class="issue info">当前内容与最近快照一致。</div>`}
         ` : html`<div class="empty">保存一次版本后即可比较字段、属性和示例变化。</div>`}
         ${this.hasStaleExamples(component) ? html`<div class="issue warning" style="margin-top: 14px"><strong>检测到待迁移示例</strong>迁移会保留代码内容，清理已删除属性引用并更新契约版本。<br /><button @click=${() => this.store.migrateExamples()}>立即迁移</button></div>` : nothing}
       </section>
     `;
+  }
+
+  private toggleRestoreItem(id: string) {
+    this.restoreChecked.has(id) ? this.restoreChecked.delete(id) : this.restoreChecked.add(id);
+    this.restoreMissing = [];
+    this.requestUpdate();
+  }
+
+  private applyRestore(snapshot: ComponentSnapshot) {
+    const fields: string[] = [];
+    const propertyIds: string[] = [];
+    const exampleIds: string[] = [];
+    for (const id of this.restoreChecked) {
+      const [kind, ...rest] = id.split(':');
+      const key = rest.join(':');
+      if (kind === 'field') fields.push(key);
+      else if (kind === 'property') propertyIds.push(key);
+      else if (kind === 'example') exampleIds.push(key);
+    }
+    const missing = this.store.applySnapshotRestore(snapshot.revision, { fields, propertyIds, exampleIds });
+    if (missing.length) {
+      this.restoreMissing = missing;
+      this.flash('恢复已停止：示例缺少依赖属性');
+      return;
+    }
+    this.restoreMissing = [];
+    this.restoreChecked.clear();
+    this.flash(`已恢复所选内容，当前为 r${this.store.selected?.revision ?? 0}`);
   }
 
   private renderPreview(component?: ComponentSpec): TemplateResult {

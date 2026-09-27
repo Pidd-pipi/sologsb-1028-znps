@@ -1,5 +1,6 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import { RESTORABLE_FIELDS } from './diff';
+import type { ComponentSnapshot, ComponentSpec, RestoreMissing, RestorePick, ValidationIssue, WorkspaceState } from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
@@ -194,6 +195,72 @@ export class SpecStore extends EventTarget {
       target.revision += 1;
       target.updatedAt = new Date().toISOString();
     });
+  }
+
+  /**
+   * Restores only the picked fields, properties and examples from a snapshot.
+   * Returns the list of missing property references (empty when the restore
+   * was applied). A non-empty result means nothing was committed: every picked
+   * example must have its referenced properties present in the current draft
+   * or picked for restore as well.
+   */
+  applySnapshotRestore(snapshotRevision: number, picked: RestorePick): RestoreMissing[] {
+    const selected = this.selected;
+    if (!selected) return [{ example: '', property: '未选择组件' }];
+    const snapshot = selected.snapshots.find((item) => item.revision === snapshotRevision);
+    if (!snapshot) return [{ example: '', property: `找不到 r${snapshotRevision} 快照` }];
+    const source = snapshot.component;
+
+    const pickedExamples = new Set(picked.exampleIds);
+    const pickedProperties = new Set(picked.propertyIds);
+    const currentPropertyIds = new Set(selected.properties.map((item) => item.id));
+    const missing = new Map<string, RestoreMissing>();
+    for (const example of source.examples) {
+      if (!pickedExamples.has(example.id)) continue;
+      for (const propertyId of example.propertyIds) {
+        if (currentPropertyIds.has(propertyId) || pickedProperties.has(propertyId)) continue;
+        const propertyName = source.properties.find((item) => item.id === propertyId)?.name ?? propertyId;
+        missing.set(`${example.id}:${propertyId}`, { example: example.title, property: propertyName });
+      }
+    }
+    if (missing.size) return [...missing.values()];
+
+    const fields = picked.fields.filter((field): field is (typeof RESTORABLE_FIELDS)[number] =>
+      (RESTORABLE_FIELDS as readonly string[]).includes(field)
+    );
+    this.commit('按快照恢复所选内容', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      if (!target) return;
+      // Archive the pre-restore draft as a new revision; existing snapshots stay untouched.
+      const { snapshots: _ignored, ...preRestore } = clone(target);
+      target.snapshots.unshift({
+        revision: target.revision,
+        savedAt: new Date().toISOString(),
+        reason: `恢复 r${snapshotRevision} 所选内容前自动备份`,
+        component: { ...preRestore, revision: target.revision }
+      });
+      target.snapshots = target.snapshots.slice(0, 12);
+      for (const field of fields) {
+        (target as unknown as Record<string, string>)[field] = clone(source[field]);
+      }
+      for (const propertyId of pickedProperties) {
+        const property = source.properties.find((item) => item.id === propertyId);
+        if (!property) continue;
+        const index = target.properties.findIndex((item) => item.id === propertyId);
+        if (index >= 0) target.properties[index] = clone(property);
+        else target.properties.push(clone(property));
+      }
+      for (const exampleId of pickedExamples) {
+        const example = source.examples.find((item) => item.id === exampleId);
+        if (!example) continue;
+        const index = target.examples.findIndex((item) => item.id === exampleId);
+        if (index >= 0) target.examples[index] = clone(example);
+        else target.examples.push(clone(example));
+      }
+      target.revision += 1;
+      target.updatedAt = new Date().toISOString();
+    });
+    return [];
   }
 
   validate(): ValidationIssue[] {

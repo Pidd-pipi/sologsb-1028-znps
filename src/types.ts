@@ -61,8 +61,21 @@ export interface ValidationIssue {
   field: 'properties' | 'examples' | 'keyboard' | 'screenReader';
 }
 
-export interface DiffRow {
-  field: string;
+export interface RestoreItem {
+  id: string;
+  kind: 'field' | 'property' | 'example';
+  label: string;
   before: string;
   after: string;
+}
+
+export interface RestorePick {
+  fields: string[];
+  propertyIds: string[];
+  exampleIds: string[];
+}
+
+export interface RestoreMissing {
+  example: string;
+  property: string;
 }
